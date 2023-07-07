@@ -1,0 +1,100 @@
+def getGitAuthor = {
+    def commit = sh(returnStdout: true, script: 'git rev-parse HEAD')
+    author = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' ${commit}").trim()
+}
+
+def getLastCommitMessage = {
+    message = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+}
+
+def notifyBitbucket(String state) {
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state         // Set result of currentBuild !Important!
+    }
+    notifyBitbucket(
+            commitSha1: sh (script: "git log -n 1 --pretty=format:'%H'", returnStdout: true),
+            credentialsId: 'sadatnfs-stash',
+            disableInprogressNotification: false,
+            considerUnstableAsSuccess: true,
+            ignoreUnverifiedSSLPeer: true,
+            includeBuildNumberInKey: false,
+            prependParentProjectKey: false,
+            projectKey: '',
+            stashServerBaseUrl: 'URLPATH',
+            stashRootUrl: 'URLPATH')
+}
+
+pipeline { 
+  agent any
+   stages {
+      stage ("Checkout SCM and check if CI is going to be skipped or not") {
+        steps {
+            script {
+               checkout scm
+               result = sh (script: "git log -1 | grep '.*\\[ci skip\\].*'", returnStatus: true) 
+               if (result == 0) {
+                  build_pass = 1
+                  echo ("'ci skip' spotted in git commit. Skipping ci-run-tests block in Makefile.")
+                  slackSend color: 'good', message: "'[ci skip]' spotted in git commit. Aborting." 
+               }
+            }
+        }
+      }
+
+     stage("Baseline Test Framework") {
+         steps {
+          script {
+            // Important: scm is checked out to grab author info
+            checkout scm
+            // Get commit and author info
+            getLastCommitMessage()
+            getGitAuthor()
+            
+            // Create env variable for whether or not to run pipeline
+            env.inttest = sh (script: "git log -1 | grep '.*\\[int test\\].*'", returnStatus: true)
+
+            if (result != 0) {
+                 notifyBitbucket('INPROGRESS')     // Notifies the Stash Instance of an INPROGRESS build 
+                 slackSend color: 'good', message: "Starting Job '${env.JOB_NAME}' with commit from author ${author} with commit message: '${message}'. Commit ID: '${env.GIT_COMMIT}'"
+                 slackSend color: 'good', message: "Job URL: ${env.BUILD_URL}console "
+                  try {
+                      sh "make ci-all"
+                      slackSend color: 'good', message: "ci-all ran successfully for '${env.JOB_NAME}' by ${author}'s commit: '${message}' . Rejoice!"
+                      build_pass = 1
+		      currentBuild.result = 'SUCCESS'
+		   //   notifyBitbucket('SUCCESS')
+
+		      // Build docs if on origin/develop (that is, merging the PR)
+		      // The branch checking has been moved into the Makefile
+		      sh "make ci-make-docs"
+
+		  } catch(err) {
+                        currentBuild.result = 'FAILED'
+                        build_pass = 0
+                        slackSend color: 'danger', message: "ci-all failed for '${env.JOB_NAME}' by ${author} for commit: '${message}'"
+	      	     //   notifyBitbucket('FAILED')
+		    }
+
+                  }
+              }
+            }
+         }
+        stage("Send SUCCESSFUL Slack notification") {
+          steps {
+              script{
+                    sh "echo 'Sending Slack notification to lbd-jenkins'"
+                    if (result != 0) {
+                       if (build_pass == 1) {
+                            slackSend color: 'good', message: "End of job for ${author}'s commit: ${message}. Have a good day, please...."
+                       }
+                        if (build_pass == 0) {
+                            slackSend color: 'danger', message: "Job '${env.JOB_NAME}' by ${author}'s commit: '${message}' failed."
+							slackSend color: 'danger', message: "Check URL for details: ${env.BUILD_URL}console "
+                       }
+                    } 
+                }
+          }
+        }
+     }
+  }
+
